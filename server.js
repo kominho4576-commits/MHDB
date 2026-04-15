@@ -25,6 +25,29 @@ app.get('/', (_req, res) => {
   return res.send('MHDB Server Online');
 });
 
+
+// ── 입력값 제한 상수 ──────────────────────────────────────────────
+const MAX_ROOMS        = 200;      // 동시 방 최대 개수
+const MAX_NAME_LEN     = 24;       // playerName, monsterName
+const MAX_TITLE_LEN    = 32;       // title
+const MAX_CODE_LEN     = 12;       // 방 코드
+const MAX_MONSTER_HP   = 500000;   // monsterBaseHp 상한
+const MAX_MONSTER_TIME = 300;      // monsterTime 상한 (초)
+const MAX_DAMAGE       = 99999;    // 1회 데미지 상한
+const MAX_ZENNY        = 100000;   // rewardZenny 상한
+const CODE_RE          = /^[A-Z0-9]{1,12}$/;  // 방 코드 형식
+
+function sanitizeStr(val, maxLen) {
+  return String(val || '').trim().slice(0, maxLen);
+}
+function clampNum(val, min, max) {
+  const n = Number(val) || 0;
+  return Math.min(max, Math.max(min, n));
+}
+function validCode(code) {
+  return CODE_RE.test(code);
+}
+// ─────────────────────────────────────────────────────────────────
 const partyRooms = {};
 const raidRooms = {};
 
@@ -295,31 +318,32 @@ io.on('connection', (socket) => {
 
   socket.on('createPartyRoom', (payload = {}) => {
     const code = String(payload.code || '').trim().toUpperCase();
-    if (!code) return socket.emit('roomError', 'Invalid room code');
+    if (!code || !validCode(code)) return socket.emit('roomError', 'Invalid room code');
     if (partyRooms[code]) return socket.emit('roomError', 'Room code conflict, retry');
-    const monsterBaseHp = Number(payload.monsterBaseHp || payload.monsterHp || 1) || 1;
+    if (Object.keys(partyRooms).length >= MAX_ROOMS) return socket.emit('roomError', 'Server full, try later');
+    const monsterBaseHp = clampNum(payload.monsterBaseHp || payload.monsterHp, 1, MAX_MONSTER_HP);
     partyRooms[code] = {
       code,
       hostId: socket.id,
-      monsterId: payload.monsterId || '',
-      monsterName: payload.monsterName || '',
+      monsterId: sanitizeStr(payload.monsterId, 32),
+      monsterName: sanitizeStr(payload.monsterName, MAX_NAME_LEN),
       monsterBaseHp,
-      monsterTime: Number(payload.monsterTime || 30) || 30,
-      monsterTier: Number(payload.monsterTier || 1) || 1,
-      rewardZenny: Number(payload.monsterZenny || 50) || 50,
-      rewardMaterialName: payload.monsterBone || 'Monster Bone',
+      monsterTime: clampNum(payload.monsterTime || 30, 10, MAX_MONSTER_TIME),
+      monsterTier: clampNum(payload.monsterTier || 1, 1, 5),
+      rewardZenny: clampNum(payload.monsterZenny || 50, 0, MAX_ZENNY),
+      rewardMaterialName: sanitizeStr(payload.monsterBone || 'Monster Bone', 32),
       members: [
         {
           id: socket.id,
-          name: payload.playerName || 'Player',
-          avatarId: payload.avatarId || 'weapon',
-          title: payload.title || '',
+          name: sanitizeStr(payload.playerName || 'Player', MAX_NAME_LEN),
+          avatarId: sanitizeStr(payload.avatarId || 'weapon', 32),
+          title: sanitizeStr(payload.title, MAX_TITLE_LEN),
           damage: 0,
           active: true,
           connected: true,
           alive: true,
           leftBattle: false,
-          timeLeft: Number(payload.monsterTime || 30) || 30,
+          timeLeft: clampNum(payload.monsterTime || 30, 10, MAX_MONSTER_TIME),
           claimed: true,
           potionUsed: false,
         },
@@ -347,15 +371,15 @@ io.on('connection', (socket) => {
     if (r.members.length >= 4) return socket.emit('roomError', 'Room is full (max 4)');
     r.members.push({
       id: socket.id,
-      name: payload.playerName || 'Player',
-      avatarId: payload.avatarId || 'weapon',
-      title: payload.title || '',
+      name: sanitizeStr(payload.playerName || 'Player', MAX_NAME_LEN),
+      avatarId: sanitizeStr(payload.avatarId || 'weapon', 32),
+      title: sanitizeStr(payload.title, MAX_TITLE_LEN),
       damage: 0,
       active: true,
       connected: true,
       alive: true,
       leftBattle: false,
-      timeLeft: Number(r.monsterTime || 30) || 30,
+      timeLeft: clampNum(r.monsterTime || 30, 10, MAX_MONSTER_TIME),
       claimed: true,
       potionUsed: false,
     });
@@ -376,6 +400,7 @@ io.on('connection', (socket) => {
   socket.on('kickMember', ({ roomCode, targetId } = {}) => {
     const r = partyRooms[String(roomCode || '').trim().toUpperCase()];
     if (!r || r.hostId !== socket.id) return;
+    if (targetId === socket.id) return;  // 자기 자신 kick 불가
     const target = r.members.find((m) => m.id === targetId);
     if (!target) return;
     target.leftBattle = true;
@@ -396,7 +421,7 @@ io.on('connection', (socket) => {
     const roomCode = String(payload.roomCode || '').trim().toUpperCase();
     const r = partyRooms[roomCode];
     if (!r || r.hostId !== socket.id || (r.battle && r.battle.active)) return;
-    const baseHp = Number(payload.monsterBaseHp || r.monsterBaseHp || 1) || 1;
+    const baseHp = clampNum(r.monsterBaseHp || 1, 1, MAX_MONSTER_HP);  // 서버 저장값 사용, 클라이언트 override 불가
     const hp = computePartyMonsterHp(baseHp, r.members.length);
     const time = Number(payload.monsterTime || r.monsterTime || 30) || 30;
     r.monsterId = payload.monsterId || r.monsterId;
@@ -440,7 +465,7 @@ io.on('connection', (socket) => {
     if (!r || !r.battle || !r.battle.active || r.battle.ended) return;
     const member = r.members.find((m) => m.id === socket.id);
     if (!member || member.leftBattle === true || member.alive === false) return;
-    member.timeLeft = Math.max(0, (Number(member.timeLeft) || 0) - Math.max(0, Number(seconds) || 0));
+    member.timeLeft = Math.max(0, (Number(member.timeLeft) || 0) - clampNum(seconds, 0, 60));
     if (member.timeLeft <= 0) {
       member.timeLeft = 0;
       member.alive = false;
@@ -456,9 +481,9 @@ io.on('connection', (socket) => {
     if (!r || !r.battle || !r.battle.active || r.battle.ended) return;
     const member = r.members.find((m) => m.id === socket.id);
     if (!member || member.leftBattle === true || member.alive === false) return;
-    if (playerName) member.name = playerName;
-    if (title) member.title = title;
-    const dmg = Math.max(0, Number(damage) || 0);
+    if (playerName) member.name = sanitizeStr(playerName, MAX_NAME_LEN);
+    if (title) member.title = sanitizeStr(title, MAX_TITLE_LEN);
+    const dmg = clampNum(damage, 0, MAX_DAMAGE);
     if (!dmg) return;
     member.damage += dmg;
     r.battle.currentHp = Math.max(0, r.battle.currentHp - dmg);
@@ -598,39 +623,7 @@ io.on('connection', (socket) => {
       }
     });
   });
-});
 
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`MHDB server running on :${PORT}`);
-});
-
-
-function getRaidRoomList(dragonId) {
-  return Object.values(partyRooms)
-    .filter((r) => r.isRaid === true)
-    .filter((r) => !dragonId || String(r.monsterId||'') === String(dragonId))
-    .filter((r) => !r.battle)
-    .map((r) => ({
-      code: r.code,
-      dragonId: r.monsterId || '',
-      monsterId: r.monsterId || '',
-      monsterName: r.monsterName || '',
-      hostName: r.members[0]?.name || '',
-      memberCount: r.members.length,
-      monsterHp: computePartyMonsterHp(r.monsterBaseHp || 1, r.members.length),
-      monsterBaseHp: r.monsterBaseHp || 1,
-    }));
-}
-
-function emitRaidRoomList(dragonId) {
-  io.emit('raidRoomListUpdated', {
-    dragonId: dragonId || '',
-    rooms: getRaidRoomList(dragonId),
-  });
-}
-
-io.on('connection', (socket) => {
   socket.on('getRaidRooms', (payload = {}) => {
     const dragonId = String(payload.dragonId || '').trim();
     socket.emit('raidRoomList', {
@@ -641,14 +634,15 @@ io.on('connection', (socket) => {
 
   socket.on('createRaidRoom', (payload = {}) => {
     const code = String(payload.code || '').trim().toUpperCase();
-    if (!code) return socket.emit('roomError', 'Invalid raid room code');
+    if (!code || !validCode(code)) return socket.emit('roomError', 'Invalid raid room code');
     if (partyRooms[code]) return socket.emit('roomError', 'Room code conflict, retry');
-    const dragonId = String(payload.dragonId || '').trim();
+    if (Object.keys(partyRooms).length >= MAX_ROOMS) return socket.emit('roomError', 'Server full, try later');
+    const dragonId = sanitizeStr(payload.dragonId, 32);
     if (!dragonId) return socket.emit('roomError', 'Invalid raid target');
-    const monsterBaseHp = Number(payload.monsterBaseHp || payload.monsterHp || 1) || 1;
-    const monsterTime = Number(payload.monsterTime || 60) || 60;
-    const monsterTier = Number(payload.monsterTier || 5) || 5;
-    const rewardZenny = Number(payload.monsterZenny || 420) || 420;
+    const monsterBaseHp = clampNum(payload.monsterBaseHp || payload.monsterHp || 1, 1, MAX_MONSTER_HP);
+    const monsterTime = clampNum(payload.monsterTime || 60, 10, MAX_MONSTER_TIME);
+    const monsterTier = clampNum(payload.monsterTier || 5, 1, 5);
+    const rewardZenny = clampNum(payload.monsterZenny || 420, 0, MAX_ZENNY);
     partyRooms[code] = {
       code,
       isRaid: true,
@@ -665,9 +659,9 @@ io.on('connection', (socket) => {
       members: [
         {
           id: socket.id,
-          name: payload.playerName || 'Player',
-          avatarId: payload.avatarId || 'weapon',
-          title: payload.title || '',
+          name: sanitizeStr(payload.playerName || 'Player', MAX_NAME_LEN),
+          avatarId: sanitizeStr(payload.avatarId || 'weapon', 32),
+          title: sanitizeStr(payload.title, MAX_TITLE_LEN),
           damage: 0,
           active: true,
           connected: true,
@@ -704,15 +698,15 @@ io.on('connection', (socket) => {
     r.members = r.members.filter((m) => m.id !== socket.id);
     r.members.push({
       id: socket.id,
-      name: payload.playerName || 'Player',
-      avatarId: payload.avatarId || 'weapon',
-      title: payload.title || '',
+      name: sanitizeStr(payload.playerName || 'Player', MAX_NAME_LEN),
+      avatarId: sanitizeStr(payload.avatarId || 'weapon', 32),
+      title: sanitizeStr(payload.title, MAX_TITLE_LEN),
       damage: 0,
       active: true,
       connected: true,
       alive: true,
       leftBattle: false,
-      timeLeft: Number(r.monsterTime || 60) || 60,
+      timeLeft: clampNum(r.monsterTime || 60, 10, MAX_MONSTER_TIME),
       claimed: true,
       potionUsed: false,
     });
@@ -774,3 +768,4 @@ io.on('connection', (socket) => {
     emitRaidRoomList(r.monsterId);
   });
 });
+
